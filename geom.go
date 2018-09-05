@@ -26,11 +26,41 @@
 package polyclip
 
 import (
+	"encoding/json"
+	"fmt"
 	"math"
 )
 
 type Point struct {
 	X, Y float64
+}
+
+func (p *Point) MarshalJSON() ([]byte, error) {
+	return []byte(`[` + fmt.Sprintf("%.8f", p.X) + `,` + fmt.Sprintf("%.8f", p.Y) + `]`), nil
+}
+
+type point Point
+
+func (p *Point) UnmarshalJSON(b []byte) (err error) {
+	var j [2]float64 // := make(map[string]float64)
+	err = json.Unmarshal(b, &j)
+	if err != nil { //Point é um map
+		j := make(map[string]float64)
+		err = json.Unmarshal(b, &j)
+		if err != nil {
+			panic(err)
+		}
+		p.X = j["x"]
+		p.Y = j["y"]
+		return
+	}
+	if err == nil {
+		p.X = j[0]
+		p.Y = j[1]
+		return
+	}
+	panic(err)
+	return
 }
 
 // Equals returns true if both p1 and p2 describe exactly the same point.
@@ -63,6 +93,11 @@ func (r1 Rectangle) union(r2 Rectangle) Rectangle {
 func (r1 Rectangle) Overlaps(r2 Rectangle) bool {
 	return r1.Min.X <= r2.Max.X && r1.Max.X >= r2.Min.X &&
 		r1.Min.Y <= r2.Max.Y && r1.Max.Y >= r2.Min.Y
+}
+
+// Return the rectangle's center
+func (r1 Rectangle) Center() Point {
+	return Point{(r1.Max.X + r1.Min.X) / 2.0, (r1.Max.Y + r1.Min.Y) / 2.0}
 }
 
 // Used to represent an edge of a polygon.
@@ -127,15 +162,8 @@ func (c Contour) Contains(p Point) bool {
 		}
 		next := c[ii]
 
-		// Is the point out of the edge's bounding box?
-		// bottom vertex is inclusive (belongs to edge), top vertex is
-		// exclusive (not part of edge) -- i.e. p lies "slightly above
-		// the ray"
-		bottom, top := curr, next
-		if bottom.Y > top.Y {
-			bottom, top = top, bottom
-		}
-		if p.Y < bottom.Y || p.Y >= top.Y {
+		if (p.Y >= next.Y || p.Y <= curr.Y) &&
+			(p.Y >= curr.Y || p.Y <= next.Y) {
 			continue
 		}
 		// Edge is from curr to next.
@@ -155,6 +183,112 @@ func (c Contour) Contains(p Point) bool {
 	}
 
 	return intersections%2 != 0
+}
+
+// Checks if a point is inside a contour using the "point in polygon" raycast method.
+// This works for all polygons, whether they are clockwise or counter clockwise,
+// convex or concave.
+// See: http://en.wikipedia.org/wiki/Point_in_polygon#Ray_casting_algorithm
+// Returns true if p is inside the polygon defined by contour.
+func (c Contour) ContainsWnPoly(p Point) bool {
+	cn := 0
+	for i := range c { // edge from c[i]  to nextC
+		C := c[i]
+		var nextC Point
+		if i+1 == len(c) {
+			nextC = c[0]
+		} else {
+			nextC = c[i+1]
+		}
+		if ((C.Y <= p.Y) && (nextC.Y > p.Y)) || ((C.Y > p.Y) && (nextC.Y <= p.Y)) { // a downward crossing
+			// compute  the actual edge-ray intersect x-coordinate
+			vt := float64(p.Y-C.Y) / (nextC.Y - C.Y)
+			if p.X < C.X+vt*(nextC.X-C.X) { // p.Coordinates.X < intersect
+				cn++ // a valid crossing of y=p.Coordinates[1] right of p.Coordinates[0]
+			}
+		}
+	}
+	return (cn&1 == 1) // 0 if even (out), and 1 if  odd (in)
+}
+
+func (c Contour) Smooth() {
+	prevPt := c[0]
+	nPoints := len(c)
+	for i, pt := range c[1:] { // edge from c[i]  to nextC
+		pt.X += prevPt.X
+		pt.X /= 2.0
+		pt.Y += prevPt.Y
+		pt.Y /= 2.0
+		prevPt = pt
+		c[i] = pt
+	}
+	c[nPoints-1] = c[0]
+}
+
+func (c Contour) GetReversed() Contour {
+	var rc Contour
+	L := len(c) - 1
+	for i, _ := range c { // edge from c[i]  to nextC
+		rc.Add(c[L-i])
+	}
+	return rc
+}
+
+func (c Contour) SmoothRDP(epsilon float64) Contour {
+	a := smoothRDP(c, epsilon)
+	a[len(a)-1] = a[0]
+	return a
+}
+
+func rDPfindPerpendicularDistance(p, p1, p2 Point) (result float64) {
+	if p1.X == p2.X {
+		result = math.Abs(float64(p.X - p1.X))
+	} else {
+		slope := float64(p2.Y-p1.Y) / float64(p2.X-p1.X)
+		intercept := float64(p1.Y) - (slope * float64(p1.X))
+		result = math.Abs(slope*float64(p.X)-float64(p.Y)+intercept) / math.Sqrt(math.Pow(slope, 2)+1)
+	}
+	return
+}
+
+func smoothRDP(points []Point, epsilon float64) []Point {
+	if len(points) < 3 {
+		return points
+	}
+	firstPoint := points[0]
+	lastPoint := points[len(points)-2]
+	index := -1
+	dist := float64(0)
+	for i := 1; i < len(points)-1; i++ {
+		cDist := rDPfindPerpendicularDistance(points[i], firstPoint, lastPoint)
+		if cDist > dist {
+			dist = cDist
+			index = i
+		}
+	}
+	if dist > epsilon {
+		l1 := points[0 : index+1]
+		l2 := points[index:]
+		r1 := smoothRDP(l1, epsilon)
+		r2 := smoothRDP(l2, epsilon)
+		rs := append(r1[0:len(r1)-1], r2...)
+		return rs
+	} else {
+		ret := make([]Point, 0)
+		ret = append(ret, firstPoint, lastPoint)
+		return ret
+	}
+	return make([]Point, 0)
+}
+
+func (c Contour) SignedArea() float64 {
+	sA := 0.0
+	prev := c[0]
+	for _, pt := range c[1:] { // edge from c[i]  to nextC
+		sA += (prev.X*pt.Y - prev.Y*pt.X)
+		prev = pt
+	}
+	return sA / 2.0
 }
 
 // Clone returns a copy of a contour.
@@ -177,6 +311,7 @@ func (p Polygon) NumVertices() int {
 
 // BoundingBox finds minimum and maximum coordinates of points in a polygon.
 func (p Polygon) BoundingBox() Rectangle {
+	//fmt.Printf("\nPolygon pp->%#v\n", p)
 	bb := p[0].BoundingBox()
 	for _, c := range p[1:] {
 		bb = bb.union(c.BoundingBox())
